@@ -1,0 +1,13 @@
+{
+  "name": "same-word",
+  "version": "1.0.0",
+  "private": true,
+  "description": "同词相遇 · 双人默契小游戏（联机版）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
