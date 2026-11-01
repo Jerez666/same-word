@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: same-word
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: "npm install --omit=dev"
+    startCommand: "node server.js"
+    healthCheckPath: /api/health
+    autoDeploy: true
