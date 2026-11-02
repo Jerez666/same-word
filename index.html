@@ -885,10 +885,8 @@ $("#btnSubmit").addEventListener("click", submit);
 
 $("#btnQuit").addEventListener("click", ()=>{
   stopTimer();
-  stopRoomCountdown();
-  if(R.es){ R.es.close(); R.es = null; }
-  R.code = ""; R.state = null;
-  S.lock = true;
+  leaveRoom();
+  S.mode = ""; S.lock = true;
   document.querySelectorAll(".screen").forEach(s=>s.classList.remove("on"));
   $("#scrSetup").classList.add("on");
   hud(false);
@@ -897,8 +895,7 @@ $("#btnQuit").addEventListener("click", ()=>{
 $("#btnAgain").addEventListener("click", ()=>{
   stopTimer(); parts=[]; ctx.clearRect(0,0,innerWidth,innerHeight);
   if(S.mode === "room"){
-    if(R.es){ R.es.close(); R.es = null; }
-    R.state = null; R.code = "";
+    leaveRoom();
     $("#btnAgain").textContent = "再 来 一 局";
     roomCreate();
     return;
@@ -907,37 +904,37 @@ $("#btnAgain").addEventListener("click", ()=>{
 });
 $("#btnBack").addEventListener("click", ()=>{
   stopTimer();
-  stopRoomCountdown();
-  if(R.es){ R.es.close(); R.es = null; }
-  R.code = ""; R.state = null; S.mode = "";
+  leaveRoom();
+  S.mode = "";
   $("#btnAgain").textContent = "再 来 一 局";
   show("#scrSetup"); hud(false); $("#historyBar").innerHTML="";
 });
 
 /* ============================================================
-   联机房间（服务端 SSE 推送）
+   联机房间：浏览器直连 ntfy.sh 公共中继（全程 443，不需要服务器）
+   房主（创建者）持状态，通过中继收发消息
    ============================================================ */
-const R = { code:"", pid:"", es:null, state:null, raf:null, endAt:0, total:0 };
+const NTFY = "https://ntfy.sh/";
+const TOPIC_PREFIX = "sameword-v2-";
 
-function myPid(){
-  const forced = new URLSearchParams(location.search).get("pid");
-  if(forced) return forced;
-  let p = sessionStorage.getItem("sw_pid");
-  if(!p){ p = "p" + Math.random().toString(36).slice(2,10); sessionStorage.setItem("sw_pid", p); }
-  return p;
+const R = { code:"", role:"", es:null, myId:"", timer:null, raf:null, ready:false, pending:false };
+const G = { phase:"waiting", round:1, prev:null, a:null, b:null,
+            result:null, history:[], myDone:false, endAt:0, total:0 };
+
+function newId(){ return "u" + Math.random().toString(36).slice(2,10); }
+function randomCode(){
+  const A = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let s = ""; for(let i=0;i<4;i++) s += A[Math.floor(Math.random()*A.length)];
+  return s;
 }
-async function api(path, body){
-  try{
-    const r = await fetch(path, { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body||{}) });
-    return await r.json();
-  }catch(e){ return { error:"network" }; }
-}
+function topicOf(){ return NTFY + TOPIC_PREFIX + R.code.toLowerCase(); }
+
 function toast(msg){
   const d = document.createElement("div");
   d.textContent = msg;
   d.style.cssText = "position:fixed;left:50%;top:13%;transform:translateX(-50%);background:rgba(18,22,30,.96);border:1px solid rgba(255,255,255,.15);color:#eef2f8;padding:10px 18px;border-radius:12px;font-size:13px;z-index:120;letter-spacing:.05em;white-space:nowrap";
   document.body.appendChild(d);
-  setTimeout(()=>d.remove(), 2200);
+  setTimeout(()=>d.remove(), 2400);
 }
 function copyText(t){
   if(navigator.clipboard && window.isSecureContext){
@@ -953,6 +950,172 @@ function fallbackCopy(t){
   ta.remove();
 }
 
+/* ---------- 中继连接 ---------- */
+function openChannel(){
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const es = new EventSource(topicOf() + "/sse");
+    es.onopen = () => { if(!done){ done = true; resolve(es); } };
+    es.onmessage = e => {
+      let d; try { d = JSON.parse(e.data); } catch { return; }
+      if (d.event !== "message" || !d.message) return;
+      let m; try { m = JSON.parse(d.message); } catch { return; }
+      onMessage(m);
+    };
+    es.onerror = () => {
+      if(!done){ done = true; reject(new Error("sse")); }
+      else if(R.es === es){ setTimeout(()=>resync(), 1500); }
+    };
+    setTimeout(()=>{ if(!done){ done = true; try{ es.close(); }catch(e){} reject(new Error("timeout")); } }, 12000);
+  });
+}
+function publish(obj){
+  fetch(topicOf(), { method:"POST", body: JSON.stringify(obj) })
+    .catch(()=>{ /* 断线时静默，EventSource 会自动重连 */ });
+}
+function resync(){
+  if(R.role === "guest"){
+    publish({ k:"hello", from: R.myId });
+  } else if(R.role === "host"){
+    publishState();
+  }
+}
+
+/* ---------- 消息处理 ---------- */
+function onMessage(m){
+  if(!m || m.from === R.myId) return;
+
+  if(R.role === "host"){
+    if(m.k === "hello"){
+      R.oppId = m.from;
+      if(G.phase === "waiting") startRound();
+      else publishState();
+    } else if(m.k === "pick"){
+      if(m.from !== R.oppId || G.phase !== "playing" || G.b !== null) return;
+      G.b = String(m.word || "").slice(0,12);
+      publishState(); renderRoom();
+      maybeSettle();
+    }
+  } else if(R.role === "guest"){
+    if(m.k === "state") applyState(m.s);
+  }
+}
+
+function stateOf(){
+  return {
+    phase: G.phase, round: G.round, prev: G.prev,
+    aDone: G.a !== null, bDone: G.b !== null,
+    result: G.result, history: G.history,
+    limit: S.limit, remain: G.remain || 0, ts: Date.now()
+  };
+}
+function publishState(){
+  if(R.role === "host") publish({ k:"state", from: R.myId, s: stateOf() });
+}
+
+function applyState(st){
+  if(!st || (st.ts && Date.now() - st.ts > 2*3600*1000)) return;
+  G.phase = st.phase; G.round = st.round; G.prev = st.prev;
+  G.result = st.result; G.history = st.history || [];
+  if(R.role === "guest"){
+    if(st.phase === "playing") G.myDone = !!st.bDone || !!R.pending;
+    if(st.bDone || st.phase !== "playing") R.pending = false;
+  }
+  if(st.phase === "playing" && !G.endAt){
+    G.endAt = performance.now() + (st.remain || 0) * 1000;
+  }
+  if(st.phase !== "playing") G.endAt = 0;
+  R.ready = true;
+  renderRoom();
+}
+
+/* ---------- 主机侧状态机 ---------- */
+function startRound(){
+  clearTimeout(R.timer);
+  G.a = null; G.b = null; G.result = null;
+  G.myDone = false;
+  G.phase = "playing";
+  G.remain = S.limit || 0;
+  G.endAt = performance.now() + G.remain * 1000;
+  publishState(); renderRoom();
+  if(S.limit){
+    R.timer = setTimeout(()=>{
+      if(G.phase !== "playing") return;
+      G.phase = "done";
+      G.result = { a:"", b:"", hit:false, timeout:true };
+      G.endAt = 0;
+      publishState(); renderRoom();
+    }, S.limit * 1000);
+  }
+}
+function hostPick(word){
+  if(G.phase !== "playing" || G.a !== null) return;
+  G.a = word; G.myDone = true;
+  publishState(); renderRoom();
+  maybeSettle();
+}
+function maybeSettle(){
+  if(G.phase !== "playing" || G.a === null || G.b === null) return;
+  clearTimeout(R.timer);
+  const hit = norm(G.a) === norm(G.b);
+  G.result = { a:G.a, b:G.b, hit };
+  G.history = G.history.concat([[G.a, G.b]]);
+  G.phase = "result";
+  G.endAt = 0;
+  publishState(); renderRoom();
+  setTimeout(()=>{
+    if(hit){ G.phase = "done"; publishState(); renderRoom(); return; }
+    G.prev = [G.result.a, G.result.b];
+    G.round += 1;
+    startRound();
+  }, 2400);
+}
+
+/* ---------- 进房 ---------- */
+function showLobby(code, tip){
+  show("#scrRoom");
+  $("#roomChoose").style.display = "none";
+  $("#roomLobby").style.display = "block";
+  $("#lobbyCode").textContent = code;
+  $("#lobbyTip").textContent = tip || "等对方进来…";
+  hud(false);
+}
+
+async function roomCreate(){
+  if(R.role) return;
+  R.myId = newId(); R.role = "host"; R.code = randomCode(); R.ready = false;
+  G.phase = "waiting"; G.round = 1; G.prev = null; G.a = null; G.b = null;
+  G.result = null; G.history = []; G.myDone = false; G.endAt = 0;
+  showLobby(R.code, "正在连接中继…");
+  $("#dot2").classList.remove("on");
+  try{ R.es = await openChannel(); }
+  catch(e){ toast("连不上中继，检查一下网络"); R.role = ""; R.es = null; openRoomScreen(); return; }
+  publishState();
+  $("#lobbyTip").textContent = "等对方进来…";
+  S.lock = false;
+}
+
+async function roomJoin(){
+  const code = $("#roomCodeIn").value.trim().toUpperCase();
+  if(code.length !== 4){ toast("房间码是 4 位"); return; }
+  if(R.role) return;
+  R.myId = newId(); R.role = "guest"; R.code = code; R.ready = false;
+  G.phase = "waiting"; G.round = 1; G.prev = null; G.result = null;
+  G.history = []; G.myDone = false; G.endAt = 0;
+  showLobby(code, "连接中…");
+  try{ R.es = await openChannel(); }
+  catch(e){ toast("连不上中继，检查一下网络"); R.role = ""; R.es = null; openRoomScreen(); return; }
+  publish({ k:"hello", from: R.myId });
+  $("#lobbyTip").textContent = "正在找房主…";
+  setTimeout(()=>{
+    if(!R.ready && R.role === "guest"){
+      $("#lobbyTip").textContent = "没找到这个房间，确认下房间码";
+      toast("没找到这个房间");
+    }
+  }, 4000);
+  S.lock = false;
+}
+
 function openRoomScreen(){
   show("#scrRoom");
   $("#roomChoose").style.display = "flex";
@@ -963,140 +1126,101 @@ function openRoomScreen(){
   setTimeout(()=>el.focus(), 80);
 }
 
-async function roomCreate(){
-  R.pid = myPid();
-  const j = await api("/api/join", { create:true, pid:R.pid, limit:S.limit });
-  if(j.error){ toast("建房失败，稍后再试"); return; }
-  R.code = j.room;
-  openStream();
+function leaveRoom(){
+  stopRoomCountdown();
+  clearTimeout(R.timer);
+  if(R.es){ try{ R.es.close(); }catch(e){} }
+  R.es = null; R.role = ""; R.code = ""; R.ready = false; R.pending = false;
 }
 
-async function roomJoin(){
-  const code = $("#roomCodeIn").value.trim().toUpperCase();
-  if(code.length !== 4){ toast("房间码是 4 位"); return; }
-  R.pid = myPid();
-  const j = await api("/api/join", { room: code, pid: R.pid });
-  if(j.error){
-    toast(j.error === "room-full" ? "房间满了" : j.error === "game-started" ? "这局已经开始了" : "没找到这个房间");
-    return;
-  }
-  R.code = j.room;
-  openStream();
-}
-
-function openStream(){
-  if(R.es) R.es.close();
-  hud(true, 1);
-  show("#scrRoom");
-  $("#roomChoose").style.display = "none";
-  $("#roomLobby").style.display = "block";
-  $("#lobbyCode").textContent = R.code;
-  $("#lobbyTip").textContent = "等对方进来…";
-  $("#dot2").classList.remove("on");
-
-  R.es = new EventSource(`/events?room=${encodeURIComponent(R.code)}&pid=${encodeURIComponent(R.pid)}`);
-  R.es.onmessage = e => {
-    let st; try{ st = JSON.parse(e.data); }catch{ return; }
-    R.state = st;
-    renderRoom(st);
-  };
-  R.es.onerror = () => { /* EventSource 会自动重连 */ };
-}
-
+/* ---------- 倒计时 ---------- */
 function stopRoomCountdown(){
   if(R.raf){ cancelAnimationFrame(R.raf); R.raf = null; }
 }
-function roomCountdown(st){
+function startCountdown(){
   stopRoomCountdown();
   const t = $("#timer");
-  if(!st.deadline || !st.limit){
+  if(!S.limit || !G.endAt){
     t.classList.add("off"); $("#timerNum").textContent = "∞"; paintTimer(1); return;
   }
   t.classList.remove("off");
-  R.total = st.limit * 1000;
-  R.endAt = performance.now() + Math.max(0, st.deadline - st.serverNow);
+  G.total = S.limit * 1000;
   const tick = () => {
-    const left = Math.max(0, R.endAt - performance.now());
-    $("#timerNum").textContent = Math.ceil(left/1000);
-    paintTimer(left / R.total);
+    const left = Math.max(0, G.endAt - performance.now());
+    $("#timerNum").textContent = Math.ceil(left / 1000);
+    paintTimer(left / G.total);
     if(left <= 0){ stopRoomCountdown(); return; }
     R.raf = requestAnimationFrame(tick);
   };
   tick();
 }
 
-function renderRoom(st){
-  S.mode = "room"; S.round = st.round;
-  hud(true, st.round);
-  $("#hudRoundNum").textContent = st.round;
+/* ---------- 渲染 ---------- */
+function renderRoom(){
+  hud(true, G.round || 1);
+  $("#hudRoundNum").textContent = G.round;
 
-  if(st.phase === "waiting"){
-    show("#scrRoom");
-    $("#roomChoose").style.display = "none";
-    $("#roomLobby").style.display = "block";
-    $("#lobbyCode").textContent = st.room;
-    $("#dot2").classList.toggle("on", st.hasOpp);
-    $("#lobbyTip").textContent = st.hasOpp ? "对方进来了，马上开始…" : "等对方进来…";
-    hud(false);
+  if(G.phase === "waiting"){
+    showLobby(G.code, $("#lobbyTip").textContent);
     return;
   }
 
-  if(st.phase === "playing"){
+  if(G.phase === "playing"){
     show("#scrGame");
-    $("#roundNum").textContent = st.round;
-    if(st.prev){
+    $("#roundNum").textContent = G.round;
+    if(G.prev){
       $("#pair").style.display = "flex";
-      $("#wordA").textContent = st.prev[0];
-      $("#wordB").textContent = st.prev[1];
-      $("#ask").innerHTML = `想一个能把 <b>${st.prev[0]}</b> 和 <b>${st.prev[1]}</b> 连起来的词`;
+      $("#wordA").textContent = G.prev[0];
+      $("#wordB").textContent = G.prev[1];
+      $("#ask").innerHTML = `想一个能把 <b>${G.prev[0]}</b> 和 <b>${G.prev[1]}</b> 连起来的词`;
     } else {
       $("#pair").style.display = "none";
       $("#ask").innerHTML = "随便想一个词";
     }
     const inp = $("#answer");
-    if(st.selfPick != null){
-      inp.value = ""; inp.disabled = true;
+    if(G.myDone){
+      inp.disabled = true;
       $("#btnSubmit").disabled = true;
       $("#ask").innerHTML = `<b>已提交</b>，等对方交卷…`;
     } else {
+      if(inp.disabled) inp.value = "";
       inp.disabled = false;
       $("#btnSubmit").disabled = norm(inp.value).length === 0;
-      setTimeout(()=>{ if(document.activeElement !== inp) inp.focus(); }, 60);
+      if(document.activeElement !== inp) setTimeout(()=>{ try{ inp.focus(); }catch(e){} }, 60);
     }
-    roomCountdown(st);
+    startCountdown();
     return;
   }
 
-  if(st.phase === "result"){
+  if(G.phase === "result"){
     stopRoomCountdown();
     show("#scrReveal");
-    const r = st.result || {};
+    const r = G.result || {};
     $("#rvA").textContent = r.a || "—";
     $("#rvB").textContent = r.b || "—";
-    $("#verdict").textContent = `第 ${st.round} 轮`;
+    $("#verdict").textContent = `第 ${G.round} 轮`;
     $("#verdict2").textContent = r.hit ? "同 词 相 遇" : "没有相遇";
     $("#verdict2").classList.toggle("hit", !!r.hit);
     $("#rvHint").textContent = r.hit ? "默契刚好对上" : "下一轮，换个角度想";
     return;
   }
 
-  if(st.phase === "done"){
+  if(G.phase === "done"){
     stopRoomCountdown();
     hud(false);
-    const r = st.result || {};
-    const hist = st.history || [];
+    const r = G.result || {};
     if(r.timeout){
       $("#endIcon").textContent = "⏳";
       $("#endTitle").textContent = "时 间 到";
-      $("#endStat").innerHTML = `第 <b>${st.round}</b> 轮没想出来`;
+      $("#endStat").innerHTML = `第 <b>${G.round}</b> 轮没想出来`;
     } else {
       $("#endIcon").textContent = "✨";
       $("#endTitle").textContent = "同 词 相 遇";
-      $("#endStat").innerHTML = `一共 <b>${st.round}</b> 轮`;
+      $("#endStat").innerHTML = `一共 <b>${G.round}</b> 轮`;
       burst();
     }
-    const chain = $("#endChain");
-    chain.innerHTML = hist.map((p,i)=>{
+    const hist = G.history || [];
+    $("#endChain").innerHTML = hist.map((p, i) => {
       const last = i === hist.length - 1;
       if(last && r.hit) return `<span class="cw same">${p[0]}</span>`;
       return `<span class="cw a">${p[0]}</span><span class="cw b">${p[1]}</span>`;
@@ -1106,19 +1230,19 @@ function renderRoom(st){
   }
 }
 
-async function submitRoom(w){
-  const st = R.state;
-  if(!st || st.phase !== "playing" || st.selfPick != null) return;
+/* ---------- 提交 ---------- */
+function submitRoom(w){
+  if(G.phase !== "playing" || G.myDone) return;
   stopRoomCountdown();
   $("#answer").disabled = true;
   $("#btnSubmit").disabled = true;
   $("#ask").innerHTML = `<b>已提交</b>，等对方交卷…`;
-  const j = await api("/api/submit", { room: R.code, pid: R.pid, word: w });
-  if(j.error){
-    toast("提交失败，检查网络");
-    $("#answer").disabled = false;
-    $("#btnSubmit").disabled = false;
-    $("#ask").innerHTML = "再试一次";
+  if(R.role === "host"){
+    hostPick(w);
+  } else {
+    publish({ k:"pick", from: R.myId, word: w });
+    R.pending = true;
+    G.myDone = true;
   }
 }
 
@@ -1146,6 +1270,8 @@ $("#btnCopyInvite").addEventListener("click", () => {
     }, 60);
   }
 })();
+
+
 
 
 /* ============================================================
