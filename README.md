@@ -2,58 +2,7 @@
 
 两个人异地玩的猜词游戏。一个人建房拿 4 位房间码，另一个人填码进来，每轮各写一个词，撞上就赢。
 
----
-
-## 部署到 Render（全程免费，约 5 分钟）
-
-需要传 4 个文件：
-
-| 文件 | 作用 |
-|---|---|
-| `index.html` | 游戏界面（含单机版：双人同屏 / 和 AI 玩） |
-| `server.js` | 联机服务端，零依赖 |
-| `package.json` | 告诉平台怎么启动 |
-| `render.yaml` | Render 的配置，省得手填 |
-
-### 1. 注册 GitHub
-
-打开 https://github.com/signup ，用邮箱注册（用户名随便取）。
-
-### 2. 建一个仓库
-
-登录后点右上角 **+** → **New repository**
-
-- Repository name 填 `same-word`
-- 选 **Public**
-- 不要勾选任何初始化文件
-- 点 **Create repository**
-
-### 3. 上传文件
-
-在新仓库页面点 **uploading an existing file**（或 **Add file → Upload files**），
-把 `index.html`、`server.js`、`package.json`、`render.yaml` 四个文件一起拖进去，
-然后点页面下方绿色的 **Commit changes**。
-
-### 4. 注册 Render
-
-打开 https://dashboard.render.com/register ，直接点 **GitHub** 用刚注册的账号登录，
-授权时选 **Only select repositories** → 勾上 `same-word`。
-
-### 5. 部署
-
-Render 控制台点 **New +** → **Blueprint**
-
-- 选刚才那个 `same-word` 仓库
-- 它会自己读到 `render.yaml`，点 **Apply** / **Create**
-- 等 2～3 分钟，状态变成 **Live**
-
-顶部会显示网址，形如：
-
-```
-https://same-word-xxxx.onrender.com
-```
-
-**这个网址是固定的**，不会再变。把它发到微信就行。
+**线上地址：https://jerez666.github.io/same-word/**
 
 ---
 
@@ -61,18 +10,32 @@ https://same-word-xxxx.onrender.com
 
 1. 打开网址 → 选「联机房间」→「创建房间」，得到 4 位房间码
 2. 把链接和房间码发给对方
-3. 对方打开链接，填码加入，两个人就进同一局了
+3. 对方点链接、填码加入，两个人就进同一局了
 4. 每轮各写一个词，双方都交卷后才一起揭晓
+5. 撞上同一个词就通关
+
+另外还有两个单机模式：**双人同屏**（一台设备轮流输）和**和 AI 玩**。
 
 ---
 
-## 注意事项
+## 原理
 
-- **免费实例 15 分钟没人访问会休眠**，下一次打开要等 30～60 秒（页面会一直转，别关）。
-  玩起来之后就一直醒着，不会中途睡。
-- 免费额度是每月 750 小时，一个服务用不满。
-- 只有两个人能进一个房间，第三个人会提示「房间满了」。
-- 房间放在内存里，服务重启后房间就没了（重开一局即可）。
+整站是纯静态的，**没有任何服务器**：
+
+- 页面托管在 GitHub Pages
+- 联机靠 [ntfy.sh](https://ntfy.sh) 的公共消息中继，双方各自订阅同一个 topic
+- 房间码就是 topic 名（`sameword-v2-` + 4 位码）
+- 创建房间的人是「房主」，持有游戏状态，对方通过中继收发消息
+
+所以：不用绑卡、不用买服务器、电脑关机也能玩，地址永久不变。
+
+## 文件
+
+| 文件 | 作用 |
+|---|---|
+| `index.html` | 整个游戏（单文件，含三种模式） |
+| `server.js` | 早期自建服务器版本，留作备用 |
+| `test_ui.html` | 端到端自测页（需要本地起 server.js 才能用） |
 
 ## 本地跑
 
@@ -81,4 +44,12 @@ node server.js
 # 打开 http://127.0.0.1:8099
 ```
 
-改端口：`PORT=3000 node server.js`
+联机模式不依赖这个服务，直接双击 `index.html` 也能联机（但需要 https 或 localhost 环境）。
+
+---
+
+## 已知限制
+
+- ntfy.sh 是公共中继，房间码理论上可能撞名（32⁴ 分之一），介意的话可以刷新重建
+- 微信里打开 GitHub Pages 有时会慢几秒，属正常
+- 房间状态只存在于房主的浏览器里，房主关页面这局就结束了
